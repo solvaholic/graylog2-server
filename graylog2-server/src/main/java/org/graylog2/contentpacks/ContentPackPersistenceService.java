@@ -35,6 +35,7 @@ import org.graylog2.contentpacks.model.entities.EntityV1;
 import org.graylog2.database.MongoConnection;
 import org.graylog2.database.NotFoundException;
 import org.graylog2.streams.StreamService;
+import org.jooq.lambda.tuple.Tuple;
 import org.jooq.lambda.tuple.Tuple2;
 import org.mongojack.DBCursor;
 import org.mongojack.DBQuery;
@@ -118,16 +119,11 @@ public class ContentPackPersistenceService {
             ContentPackV1 cpv1 = (ContentPackV1) cp;
 
             final Set<String> allStreams = streamService.loadAll().stream().map(stream -> stream.getTitle()).collect(Collectors.toSet());
-            final Map<String, String> streamsInContentPack = new HashMap<>();
-
-            cpv1.entities()
+            final Map<String, String> streamsInContentPack = cpv1.entities()
                     .stream()
                     .filter(entity -> "stream".equals(entity.type().name()) && "1".equals(entity.type().version()))
-                    .map(entity -> new Tuple2<String, JsonNode>(entity.id().id(), ((EntityV1)entity).data().findValue("title")))
-                    .forEach(tuple2 -> {
-                        JsonNode title = tuple2.v2().findValue("@value");
-                        streamsInContentPack.put(tuple2.v1(), title.textValue());
-                    });
+                    .map(entity -> new Tuple2<String, String>(entity.id().id(), ((EntityV1)entity).data().findValue("title").findValue("@value").textValue()))
+                    .collect(Collectors.toMap(Tuple2::v1, Tuple2::v2));
 
             cpv1.entities()
                     .stream()
