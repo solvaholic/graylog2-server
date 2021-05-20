@@ -19,13 +19,20 @@ package org.graylog2.shared.initializers;
 import com.codahale.metrics.InstrumentedExecutorService;
 import com.codahale.metrics.MetricRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.jsontype.NamedType;
 import com.fasterxml.jackson.jaxrs.json.JacksonJaxbJsonProvider;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Maps;
 import com.google.common.net.HostAndPort;
 import com.google.common.util.concurrent.AbstractIdleService;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import io.swagger.v3.core.converter.ModelConverter;
+import io.swagger.v3.core.converter.ModelConverters;
+import io.swagger.v3.core.jackson.ModelResolver;
+import io.swagger.v3.core.jackson.TypeNameResolver;
+import io.swagger.v3.core.util.AnnotationsUtils;
 import io.swagger.v3.jaxrs2.integration.JaxrsOpenApiContextBuilder;
 import io.swagger.v3.jaxrs2.integration.resources.OpenApiResource;
 import io.swagger.v3.oas.integration.OpenApiConfigurationException;
@@ -35,6 +42,8 @@ import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.info.Contact;
 import io.swagger.v3.oas.models.info.Info;
 import io.swagger.v3.oas.models.info.License;
+import io.swagger.v3.oas.models.media.ComposedSchema;
+import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.oas.models.servers.Server;
@@ -55,6 +64,7 @@ import org.graylog2.audit.PluginAuditEventTypes;
 import org.graylog2.audit.jersey.AuditEventModelProcessor;
 import org.graylog2.configuration.HttpConfiguration;
 import org.graylog2.jersey.PrefixAddingModelProcessor;
+import org.graylog2.plugin.inject.JacksonSubTypes;
 import org.graylog2.plugin.inject.RestControllerPackage;
 import org.graylog2.plugin.rest.PluginRestResource;
 import org.graylog2.rest.filter.WebAppNotFoundResponseFilter;
@@ -95,11 +105,13 @@ import java.security.GeneralSecurityException;
 import java.security.InvalidKeyException;
 import java.security.KeyStore;
 import java.security.cert.CertificateException;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -118,6 +130,7 @@ public class JerseyService extends AbstractIdleService {
 
     private final HttpConfiguration configuration;
     private final Configuration graylogConfiguration;
+    private Set<NamedType> jacksonSubTypes;
     private final Map<String, Set<Class<? extends PluginRestResource>>> pluginRestResources;
     private final Set<RestControllerPackage> restControllerPackages;
 
@@ -138,6 +151,7 @@ public class JerseyService extends AbstractIdleService {
                          Set<Class<? extends ContainerResponseFilter>> containerResponseFilters,
                          Set<Class<? extends ExceptionMapper>> exceptionMappers,
                          @Named("additionalJerseyComponents") final Set<Class> additionalComponents,
+                         @JacksonSubTypes final Set<NamedType> jacksonSubTypes,
                          final Map<String, Set<Class<? extends PluginRestResource>>> pluginRestResources,
                          final Set<RestControllerPackage> restControllerPackages,
                          Set<PluginAuditEventTypes> pluginAuditEventTypes,
@@ -150,6 +164,7 @@ public class JerseyService extends AbstractIdleService {
         this.containerResponseFilters = requireNonNull(containerResponseFilters, "containerResponseFilters");
         this.exceptionMappers = requireNonNull(exceptionMappers, "exceptionMappers");
         this.additionalComponents = requireNonNull(additionalComponents, "additionalComponents");
+        this.jacksonSubTypes = requireNonNull(jacksonSubTypes, "jacksonSubTypes");
         this.pluginRestResources = requireNonNull(pluginRestResources, "pluginResources");
         this.restControllerPackages = requireNonNull(restControllerPackages, "restControllerPackages");
         this.pluginAuditEventTypes = requireNonNull(pluginAuditEventTypes, "pluginAuditEventTypes");
@@ -312,28 +327,49 @@ public class JerseyService extends AbstractIdleService {
         return rc;
     }
 
+    @SuppressWarnings("rawtypes")
     private void openAPISetup(String[] controllerPackages, ResourceConfig rc) {
         final OpenAPI openAPI = new OpenAPI();
 
         final Info info = new Info()
                 .title("Graylog")
                 .description("This is Graylog")
+                .version("4.0")
                 .contact(new Contact().email("hello@graylog.org"))
                 .license(new License().name("SSPL-1"));
 
         openAPI.info(info);
         openAPI.servers(Collections.singletonList(new Server().url("/api")));
         openAPI.addSecurityItem(new SecurityRequirement().addList("basicAuth"));
-        openAPI.components(new Components()
+        Components components = new Components()
                 .addSecuritySchemes("basicAuth", new SecurityScheme()
                         .name("basicAuth")
                         .type(SecurityScheme.Type.HTTP)
-                        .scheme("basic")));
+                        .scheme("basic"));
+        LOG.debug("Checking {} jackson subtypes for dynamic API doc schemas", jacksonSubTypes.size());
+        ModelConverters instance = ModelConverters.getInstance();
+        for (NamedType jacksonSubType : jacksonSubTypes) {
+            Class<?> type = jacksonSubType.getType();
+            // for each subtype, check if it or its ancestors are declared as @Schema. If yes, add them to the openAPI components,
+            // but if not, they are otherwise subtypes not relevant to API documentation and we don't want to include them in the docs
+            io.swagger.v3.oas.annotations.media.Schema schemaAnnotation = type.getAnnotation(io.swagger.v3.oas.annotations.media.Schema.class);
+            LOG.trace("Subtype {} {} a schema class", type.getName(), schemaAnnotation != null ? "is" : "is not");
+            if (schemaAnnotation != null) {
+                Map<String, Schema> stringSchemaMap = instance.readAll(type);
+                stringSchemaMap.forEach(components::addSchemas);
+            }
+        }
+        openAPI.components(components);
+
+        // we really want "true" but it confuses redoc :/
+        TypeNameResolver.std.setUseFqn(false);
 
         final SwaggerConfiguration swaggerConfiguration = new SwaggerConfiguration()
                 .openAPI(openAPI)
+                .readAllResources(false) // to cut down on noise for now
                 .prettyPrint(true)
                 .sortOutput(true)
+                .cacheTTL(Duration.ofSeconds(10).toMillis())
                 .resourcePackages(ImmutableSet.copyOf(controllerPackages));
 
         try {
