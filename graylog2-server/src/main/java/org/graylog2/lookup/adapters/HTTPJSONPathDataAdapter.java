@@ -206,6 +206,73 @@ public class HTTPJSONPathDataAdapter extends LookupDataAdapter {
         }
     }
 
+    @Override
+    protected LookupResult setValue(Object key, Object value) {
+        String encodedKey;
+        try {
+            encodedKey = URLEncoder.encode(String.valueOf(key), "UTF-8").replaceAll("\\+", "%20");
+        } catch (UnsupportedEncodingException ignored) {
+            // UTF-8 is always supported
+            encodedKey = String.valueOf(key);
+        }
+
+        String encodedValue;
+        try {
+            encodedValue = URLEncoder.encode(String.valueOf(value), "UTF-8").replaceAll("\\+", "%20");
+        } catch (UnsupportedEncodingException ignored) {
+            // UTF-8 is always supported
+            encodedValue = String.valueOf(value);
+        }
+
+        final String urlString = templateEngine.transform(config.url(), ImmutableMap.of("key", encodedKey), "value", encodedValue));
+
+        if (!urlWhitelistService.isWhitelisted(urlString)) {
+            LOG.error("URL <{}> is not whitelisted. Aborting lookup request.", urlString);
+            publishSystemNotificationForWhitelistFailure();
+            setError(UrlNotWhitelistedException.forUrl(urlString));
+            return getErrorResult();
+        } else {
+            // we use this kind of error reporting mechanism only for whitelist errors, so we can safely clear the
+            // error here
+            clearError();
+        }
+
+        final HttpUrl url = HttpUrl.parse(urlString);
+
+        if (url == null) {
+            LOG.error("Couldn't parse URL <{}> - returning empty result", urlString);
+            httpURLErrors.mark();
+            return getErrorResult();
+        }
+
+        final Request request = new Request.Builder()
+                .post()
+                .url(url)
+                .headers(headers)
+                .build();
+
+        final Timer.Context time = httpRequestTimer.time();
+        try (final Response response = httpClient.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                LOG.warn("HTTP request for key <{}> failed: {}", key, response);
+                httpRequestErrors.mark();
+                return getErrorResult();
+            }
+
+            final LookupResult result = parseBody(singleJsonPath, multiJsonPath, response.body().byteStream());
+            if (result == null) {
+                return getErrorResult();
+            }
+            return result;
+        } catch (IOException e) {
+            LOG.error("HTTP request error for key <{}>", key, e);
+            httpRequestErrors.mark();
+            return getErrorResult();
+        } finally {
+            time.stop();
+        }
+    }
+
     @VisibleForTesting
     static LookupResult parseBody(JsonPath singleJsonPath, @Nullable JsonPath multiJsonPath, InputStream body) {
         try {
